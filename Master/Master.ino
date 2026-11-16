@@ -15,16 +15,25 @@
 #define LCD_ADDR         0x27   // Ganti ke 0x3F jika LCD tidak menyala
 
 // RC522 (SPI dengan pin custom)
-#define PIN_RFID_RST     23
-#define PIN_RFID_MOSI    16
-#define PIN_RFID_MISO    17
-#define PIN_RFID_SCK     25
-#define PIN_RFID_SS      26     // pin "SDA" pada modul RC522
+#define PIN_RFID_RST     4
+#define PIN_RFID_MOSI    23
+#define PIN_RFID_MISO    19
+#define PIN_RFID_SCK     18
+#define PIN_RFID_SS     5     // pin "SDA" pada modul RC522
 
 #define SERIAL_FORMAT_COMPACT 1
 #define SERIAL_FORMAT_JSON    2
 #define SERIAL_FORMAT    SERIAL_FORMAT_JSON   // pilih versi paket ke Unity
 #define PACKET_VERSION   1
+
+#define ENABLE_MQTT      1
+#define WIFI_SSID        "ICT-LAB WORKSPACE"
+#define WIFI_PASS        "ICTLAB2024"
+#define MQTT_HOST        "broker.hivemq.com"
+#define MQTT_PORT        1883
+#define MQTT_TOPIC_DATA   "itenas/d11/deliverydash/telemetry"   // prefix unik: broker publik dipakai bersama
+#define MQTT_TOPIC_STATUS "itenas/d11/deliverydash/status"      // "online"/"offline" (LWT, retained)
+#define MQTT_PUBLISH_MS  100                 // 1 Hz; Serial ke Unity tetap 20 Hz
 #define NOT_AVAILABLE    (-1)   // sensor belum diimplementasi / tidak tersedia
 
 #define SERIAL_PERIOD_MS 50     // 20 Hz
@@ -236,6 +245,69 @@ static void sendSerialFrame(const Snapshot &s) {
   if (len) Serial.write((const uint8_t *)buf, len);   // satu panggilan tulis per paket
 }
 
+#if ENABLE_MQTT
+#include <PubSubClient.h>   // library "PubSubClient" by Nick O'Leary (dipasang di sini karena ENABLE_MQTT baru didefinisikan di atas)
+
+// ==========================================
+// 6b. TASK MQTT (FreeRTOS, Core 0) - publish JSON yang sama dengan versi 2
+// ==========================================
+static WiFiClient   wifiClient;
+static PubSubClient mqtt(wifiClient);
+
+void TaskMQTT(void *pvParameters) {
+  (void) pvParameters;
+
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(256);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t lastPublish = 0;
+  bool channelLogged = false;
+
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      channelLogged = false;
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+    if (!channelLogged) {
+      // Channel ini HARUS sama dengan channel Slave (ESP-NOW), lihat catatan di header
+      Serial.printf("LOG,wifi ip=%s ch=%d\n", WiFi.localIP().toString().c_str(), WiFi.channel());
+      channelLogged = true;
+    }
+
+    if (!mqtt.connected()) {
+      String id = "d11-master-" + WiFi.macAddress();
+      if (mqtt.connect(id.c_str(), NULL, NULL, MQTT_TOPIC_STATUS, 1, true, "offline")) {
+        mqtt.publish(MQTT_TOPIC_STATUS, "online", true);
+        Serial.println("LOG,mqtt connected");
+      } else {
+        Serial.printf("LOG,mqtt connect failed rc=%d\n", mqtt.state());
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        continue;
+      }
+    }
+
+    mqtt.loop();
+
+    uint32_t now = millis();
+    if (now - lastPublish >= MQTT_PUBLISH_MS) {
+      lastPublish = now;
+      Snapshot s;
+      readState(s);
+      char buf[192];
+      size_t len = buildJson(buf, sizeof(buf), s);
+      if (len) {
+        buf[len - 1] = '\0';                 // buang '\n' (khusus Serial)
+        mqtt.publish(MQTT_TOPIC_DATA, buf);   // QoS 0
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+#endif
+
 // ==========================================
 // 7. SETUP & LOOP
 // ==========================================
@@ -257,6 +329,10 @@ void setup() {
   } else {
     Serial.println("LOG,esp-now init failed");
   }
+
+#if ENABLE_MQTT
+  xTaskCreatePinnedToCore(TaskMQTT, "MQTTTask", 6144, NULL, 1, NULL, 0);
+#endif
 }
 
 void loop() {
