@@ -26,9 +26,13 @@
 #define SERIAL_FORMAT    SERIAL_FORMAT_JSON   // pilih versi paket ke Unity
 #define PACKET_VERSION   1
 
+// MQTT: 0 = mati (tanpa Wi-Fi/MQTT). 1 = aktif.
+// Jika 1: butuh library PubSubClient (Nick O'Leary) dan isi kredensial di bawah.
+// TESTING ONLY: broker publik HiveMQ tanpa autentikasi -> siapa pun bisa membaca/menulis topik.
+// Jangan kirim data pribadi sungguhan (UID kartu, berat badan) ke broker ini.
 #define ENABLE_MQTT      1
-#define WIFI_SSID        "ICT-LAB WORKSPACE"
-#define WIFI_PASS        "ICTLAB2024"
+#define WIFI_SSID        "Kong"
+#define WIFI_PASS        "Kupatahutang>"
 #define MQTT_HOST        "broker.hivemq.com"
 #define MQTT_PORT        1883
 #define MQTT_TOPIC_DATA   "itenas/d11/deliverydash/telemetry"   // prefix unik: broker publik dipakai bersama
@@ -259,6 +263,10 @@ void TaskMQTT(void *pvParameters) {
 
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setBufferSize(256);
+  // PubSubClient menunggu CONNACK dengan busy-wait (yield() tidak memberi waktu ke task IDLE).
+  // Default timeout 15 s > batas Task WDT 5 s -> IDLE0 kelaparan dan board reset.
+  // Timeout harus di bawah 5 s.
+  mqtt.setSocketTimeout(3);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
@@ -279,6 +287,7 @@ void TaskMQTT(void *pvParameters) {
 
     if (!mqtt.connected()) {
       String id = "d11-master-" + WiFi.macAddress();
+      Serial.printf("LOG,mqtt connecting to %s:%d\n", MQTT_HOST, MQTT_PORT);
       if (mqtt.connect(id.c_str(), NULL, NULL, MQTT_TOPIC_STATUS, 1, true, "offline")) {
         mqtt.publish(MQTT_TOPIC_STATUS, "online", true);
         Serial.println("LOG,mqtt connected");
@@ -322,7 +331,12 @@ void setup() {
   xTaskCreatePinnedToCore(TaskRFID,      "RFIDTask", 4096, NULL, 1, NULL, 1);
 
   WiFi.mode(WIFI_STA);
-  Serial.printf("LOG,master mac=%s\n", WiFi.macAddress().c_str());   // salin ke masterAddress di Slave
+  // WiFi.macAddress() bisa mengembalikan 00:00:.. sebelum driver Wi-Fi siap.
+  // MAC STA = base MAC di efuse; ESP.getEfuseMac() tersedia di semua versi core (byte pertama = byte terendah).
+  uint64_t efuse = ESP.getEfuseMac();
+  Serial.printf("LOG,master mac=%02X:%02X:%02X:%02X:%02X:%02X\n",   // salin ke masterAddress di Slave
+                (uint8_t)(efuse >> 0),  (uint8_t)(efuse >> 8),  (uint8_t)(efuse >> 16),
+                (uint8_t)(efuse >> 24), (uint8_t)(efuse >> 32), (uint8_t)(efuse >> 40));
   if (esp_now_init() == ESP_OK) {
     esp_now_register_recv_cb(OnDataRecv);
     Serial.println("LOG,master ready");

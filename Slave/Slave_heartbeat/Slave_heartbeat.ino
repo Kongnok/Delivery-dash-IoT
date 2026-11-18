@@ -2,11 +2,14 @@
 #include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 
 #define PIN_PPG           35     // ADC1
 #define SAMPLE_PERIOD_MS  5      // 200 Hz sampling untuk deteksi puncak
 #define SEND_PERIOD_MS    100    // 10 Hz kirim; Master menganggap link putus setelah 1000 ms
 #define BEAT_TIMEOUT_MS   2500   // tidak ada detak valid selama ini -> BPM = 0
+#define WIFI_CHANNEL 12   // the ch= value from the Master
+
 
 // GANTI dengan MAC Master: lihat Serial Monitor Master, baris "LOG,master mac=..."
 uint8_t masterAddress[] = {0x8C, 0xAA, 0xB5, 0x37, 0x9E, 0x64};
@@ -36,7 +39,11 @@ void setup() {
   pinMode(PIN_PPG, INPUT);
 
   WiFi.mode(WIFI_STA);
-  Serial.printf("slave mac=%s\n", WiFi.macAddress().c_str());
+  Serial.printf("slave mac=%s\n", WiFi.macAddress().c_str());\
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  peerInfo.channel = WIFI_CHANNEL;
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("esp-now init failed");
