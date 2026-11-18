@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <LiquidCrystal_I2C.h>
 #include <MFRC522.h>
+#include <HX711.h>           // library "HX711" by Bogdan Necula (bogde)
 
 // ==========================================
 // 1. KONFIGURASI
@@ -21,6 +22,23 @@
 #define PIN_RFID_SCK     18
 #define PIN_RFID_SS     5     // pin "SDA" pada modul RC522
 
+// HX711 (weight sensor)
+#define PIN_HX711_DOUT   26     // "data"
+#define PIN_HX711_SCK    27
+#define HX711_SCALE      1.0f   // hitungan mentah per gram; 1.0 = BELUM dikalibrasi
+#define WEIGHT_POLL_MS   100    // HX711 default 10 sampel/detik
+#define TARE_SAMPLES     10
+#define WEIGHT_STALE_MS  2000   // tidak ada pembacaan selama ini -> weight = -1
+
+// Cek bentrok pin saat compile (bentrok HX711 vs RFID pernah terjadi: GPIO 26)
+#define NO_CLASH(a, b) static_assert((a) != (b), "Bentrok pin: " #a " dan " #b " - perbarui define pin")
+NO_CLASH(PIN_HX711_DOUT, PIN_RFID_SS);   NO_CLASH(PIN_HX711_DOUT, PIN_RFID_SCK);
+NO_CLASH(PIN_HX711_DOUT, PIN_RFID_MOSI); NO_CLASH(PIN_HX711_DOUT, PIN_RFID_MISO);
+NO_CLASH(PIN_HX711_DOUT, PIN_RFID_RST);
+NO_CLASH(PIN_HX711_SCK, PIN_RFID_SS);    NO_CLASH(PIN_HX711_SCK, PIN_RFID_SCK);
+NO_CLASH(PIN_HX711_SCK, PIN_RFID_MOSI);  NO_CLASH(PIN_HX711_SCK, PIN_RFID_MISO);
+NO_CLASH(PIN_HX711_SCK, PIN_RFID_RST);
+
 #define SERIAL_FORMAT_COMPACT 1
 #define SERIAL_FORMAT_JSON    2
 #define SERIAL_FORMAT    SERIAL_FORMAT_JSON   // pilih versi paket ke Unity
@@ -31,13 +49,13 @@
 // TESTING ONLY: broker publik HiveMQ tanpa autentikasi -> siapa pun bisa membaca/menulis topik.
 // Jangan kirim data pribadi sungguhan (UID kartu, berat badan) ke broker ini.
 #define ENABLE_MQTT      1
-#define WIFI_SSID        "Kong"
-#define WIFI_PASS        "Kupatahutang>"
+#define WIFI_SSID        "ISI_SSID"
+#define WIFI_PASS        "ISI_PASSWORD"
 #define MQTT_HOST        "broker.hivemq.com"
 #define MQTT_PORT        1883
 #define MQTT_TOPIC_DATA   "itenas/d11/deliverydash/telemetry"   // prefix unik: broker publik dipakai bersama
 #define MQTT_TOPIC_STATUS "itenas/d11/deliverydash/status"      // "online"/"offline" (LWT, retained)
-#define MQTT_PUBLISH_MS  100                 // 1 Hz; Serial ke Unity tetap 20 Hz
+#define MQTT_PUBLISH_MS  1000                 // 1 Hz; Serial ke Unity tetap 20 Hz
 #define NOT_AVAILABLE    (-1)   // sensor belum diimplementasi / tidak tersedia
 
 #define SERIAL_PERIOD_MS 50     // 20 Hz
@@ -49,6 +67,7 @@
 
 LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
 MFRC522 mfrc522(PIN_RFID_SS, PIN_RFID_RST);
+HX711 scale;
 
 // ==========================================
 // 2. DATA ESP-NOW & SHARED STATE
@@ -66,7 +85,7 @@ struct SharedState {
   uint32_t lastTapMs;     // 0 = belum pernah tap
   bool     session;       // true = sesi aktif (di-toggle oleh tap RFID)
   int      rpm;           // NOT_AVAILABLE sampai encoder diimplementasi (isi dari task encoder)
-  int      weight;        // NOT_AVAILABLE sampai weight sensor diimplementasi
+  int      weight;        // gram; NOT_AVAILABLE jika HX711 belum siap / tidak terbaca
 };
 
 struct Snapshot {
@@ -165,6 +184,62 @@ void TaskRFID(void *pvParameters) {
       mfrc522.PCD_StopCrypto1();
     }
     vTaskDelay(pdMS_TO_TICKS(RFID_POLL_MS));
+  }
+}
+
+// ==========================================
+// 4b. TASK WEIGHT (FreeRTOS, Core 1) - HX711
+// ==========================================
+// Tidak memakai scale.tare()/get_units() langsung di kondisi belum siap: library
+// memblok dengan delay(0) sampai HX711 ready, yang menguras CPU dan memicu watchdog
+// bila modul tidak terpasang. Semua pembacaan dijaga dengan timeout.
+void TaskWeight(void *pvParameters) {
+  (void) pvParameters;
+
+  scale.begin(PIN_HX711_DOUT, PIN_HX711_SCK);
+
+  if (!scale.wait_ready_timeout(2000, 10)) {
+    Serial.println("LOG,hx711 not found (cek DOUT/SCK/VCC)");
+    vTaskDelete(NULL);
+  }
+
+  // Tare manual: SENSOR HARUS KOSONG (tanpa beban) saat boot
+  long sum = 0;
+  int n = 0;
+  for (int i = 0; i < TARE_SAMPLES; i++) {
+    if (!scale.wait_ready_timeout(500, 10)) continue;
+    sum += scale.read();
+    n++;
+  }
+  if (n == 0) {
+    Serial.println("LOG,hx711 tare failed");
+    vTaskDelete(NULL);
+  }
+  scale.set_offset(sum / n);
+  scale.set_scale(HX711_SCALE);
+  Serial.printf("LOG,hx711 ready offset=%ld scale=%.3f\n", (long)(sum / n), (double)HX711_SCALE);
+
+  uint32_t lastOkMs = millis();
+  for (;;) {
+    int w = NOT_AVAILABLE;
+    bool got = false;
+
+    if (scale.is_ready()) {
+      float units = scale.get_units(1);
+      int v = (int)lroundf(units);
+      w = v < 0 ? 0 : v;       // -1 dicadangkan sebagai "tidak tersedia"
+      got = true;
+      lastOkMs = millis();
+    } else if ((uint32_t)(millis() - lastOkMs) < WEIGHT_STALE_MS) {
+      vTaskDelay(pdMS_TO_TICKS(WEIGHT_POLL_MS));
+      continue;                // belum ready tapi belum stale: pertahankan nilai terakhir
+    }
+
+    portENTER_CRITICAL(&stateMux);
+    g_state.weight = got ? w : NOT_AVAILABLE;
+    portEXIT_CRITICAL(&stateMux);
+
+    vTaskDelay(pdMS_TO_TICKS(WEIGHT_POLL_MS));
   }
 }
 
@@ -329,6 +404,7 @@ void setup() {
 
   xTaskCreatePinnedToCore(TaskUpdateLCD, "LCDTask",  4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(TaskRFID,      "RFIDTask", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskWeight,    "WeightTask", 4096, NULL, 1, NULL, 1);
 
   WiFi.mode(WIFI_STA);
   // WiFi.macAddress() bisa mengembalikan 00:00:.. sebelum driver Wi-Fi siap.
@@ -355,6 +431,7 @@ void loop() {
   int pot = analogRead(PIN_POTENTIO);
 
   portENTER_CRITICAL(&stateMux);
+  
   g_state.potRaw = pot;
   portEXIT_CRITICAL(&stateMux);
 
